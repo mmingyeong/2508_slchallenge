@@ -1,0 +1,24 @@
+# === General logs ===
+*.log
+logs/
+
+# === Python cache & environments ===
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+
+# === Jupyter checkpoints ===
+.ipynb_checkpoints/
+
+# === Large model & training files ===
+*.pt
+*.pth
+*.ckpt
+
+# === Datasets ===
+dataset/
+*.zip
+*.tar
+*.tar.gz
