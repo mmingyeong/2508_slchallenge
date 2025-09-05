@@ -1,0 +1,2 @@
+/caefs/data/IllustrisTNG/slchallenge/slsim_lenses/slsim_lenses/D1_L_00004419_y.fits
+/caefs/data/IllustrisTNG/slchallenge/hsc_nonlenses/hsc_nonlenses/D2_N_00025866_y.fits

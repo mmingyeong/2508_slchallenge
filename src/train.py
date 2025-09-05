@@ -3,35 +3,28 @@
 """
 Training script for binary strong-lensing classification using ConvNeXt V2.
 
-References
-----------
-- GitHub: https://github.com/facebookresearch/ConvNeXt-V2
-- Paper : ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders
-         arXiv:2301.00808
+- data_loader.py must provide `get_dataloaders(class_paths, ...)`
+- model.py must provide `convnextv2_atto/nano/tiny` (in_chans=1, num_classes=1)
 
-This script expects:
-- data_loader.py providing `get_dataloaders(class_paths, ...)`
-- model.py providing `convnextv2_atto/nano/tiny` (in_chans=1, num_classes=1)
-
-Author: (your name)
+This version adds preprocessing toggles (padding / normalization) via CLI and
+saves a concise results.json for easy comparison across runs.
 """
 
 import os
 import csv
 import time
 import math
+import json
 import argparse
 import logging
 import random
 import numpy as np
 from typing import Dict
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch
-from contextlib import nullcontext  # 필요시 CPU 대응에 사용
-
 from sklearn.metrics import accuracy_score, roc_auc_score
 from tqdm import tqdm
 
@@ -42,9 +35,6 @@ from model import convnextv2_atto, convnextv2_nano, convnextv2_tiny
 # ---------------------------
 # Utilities
 # ---------------------------
-# ---------------------------
-# Utilities
-# ---------------------------
 def setup_logger(log_file: str | None = None,
                  level: int = logging.INFO) -> logging.Logger:
     """
@@ -52,23 +42,14 @@ def setup_logger(log_file: str | None = None,
       - prints to console without breaking tqdm progress bars
       - optionally logs to a rotating file (5MB x 3 backups)
       - quiets noisy third-party loggers
-
-    Parameters
-    ----------
-    log_file : str | None
-        If provided, write logs to this file with rotation.
-    level : int
-        Logging level for both console and file handlers.
     """
-    # --- TQDM-friendly console handler --------------------------------------
     class TqdmHandler(logging.Handler):
         def emit(self, record):
             try:
                 msg = self.format(record)
                 try:
-                    # ensure nice output alongside tqdm progress bars
-                    from tqdm import tqdm
-                    tqdm.write(msg)
+                    from tqdm import tqdm as _tqdm
+                    _tqdm.write(msg)
                 except Exception:
                     print(msg)
             except Exception:
@@ -77,9 +58,8 @@ def setup_logger(log_file: str | None = None,
     logger = logging.getLogger("train")
     logger.handlers.clear()
     logger.setLevel(level)
-    logger.propagate = False  # avoid duplicate logs to root
+    logger.propagate = False
 
-    # common formats
     datefmt = "%Y-%m-%d %H:%M:%S"
     console_fmt = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
@@ -91,13 +71,11 @@ def setup_logger(log_file: str | None = None,
         datefmt=datefmt
     )
 
-    # console
     ch = TqdmHandler()
     ch.setLevel(level)
     ch.setFormatter(console_fmt)
     logger.addHandler(ch)
 
-    # rotating file
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         from logging.handlers import RotatingFileHandler
@@ -109,31 +87,19 @@ def setup_logger(log_file: str | None = None,
         fh.setFormatter(file_fmt)
         logger.addHandler(fh)
 
-    # --- quiet noisy libraries (tune as needed) ------------------------------
+    # quiet noisy libs
     logging.getLogger("data_loader").setLevel(logging.ERROR)
     logging.getLogger("astropy").setLevel(logging.ERROR)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     logging.getLogger("PIL").setLevel(logging.WARNING)
 
-    # minimal banner
-    logger.info("Logger initialized"
-                + (f" -> {log_file}" if log_file else " (console only)"))
+    logger.info("Logger initialized" + (f" -> {log_file}" if log_file else " (console only)"))
     return logger
 
 
-
 class EarlyStopping:
-    """
-    Early stopping based on validation loss.
-
-    Parameters
-    ----------
-    patience : int
-        Number of epochs to wait after last improvement.
-    min_delta : float
-        Minimum improvement over best loss to reset patience.
-    """
+    """Early stopping based on validation loss."""
     def __init__(self, patience: int = 10, min_delta: float = 0.0):
         self.patience = patience
         self.min_delta = min_delta
@@ -159,6 +125,10 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def get_amp_ctx(device: torch.device):
+    return torch.amp.autocast(device_type=device.type) if device.type == "cuda" else nullcontext()
+
+
 # ---------------------------
 # Train / Validate
 # ---------------------------
@@ -169,12 +139,12 @@ def train_one_epoch(model, loader, optimizer, scaler, device, criterion, log_eve
 
     pbar = tqdm(loader, desc="Train", leave=False)
     for i, batch in enumerate(pbar, 1):
-        imgs, labels, _ = batch  # (B,1,41,41), (B,)
+        imgs, labels, _ = batch  # (B,1,H,W), (B,)
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.float().unsqueeze(1).to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast('cuda'):
+        with get_amp_ctx(device):
             logits = model(imgs)
             loss = criterion(logits, labels)
 
@@ -184,7 +154,6 @@ def train_one_epoch(model, loader, optimizer, scaler, device, criterion, log_eve
 
         running_loss += loss.item()
 
-        # Metrics (use sigmoid for probability)
         probs = torch.sigmoid(logits).detach().cpu().numpy().squeeze()
         preds = (probs > 0.5).astype(np.int32)
         all_preds.append(preds)
@@ -212,8 +181,7 @@ def evaluate(model, loader, device, criterion, desc="Val"):
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.float().unsqueeze(1).to(device, non_blocking=True)
 
-        # 변경된 부분
-        with torch.amp.autocast('cuda'):
+        with get_amp_ctx(device):
             logits = model(imgs)
             loss = criterion(logits, labels)
 
@@ -236,7 +204,6 @@ def evaluate(model, loader, device, criterion, desc="Val"):
         auc = float("nan")
 
     return avg_loss, acc, auc
-
 
 
 # ---------------------------
@@ -269,6 +236,14 @@ def main(args):
         take_train_fraction=args.take_train_frac,
         take_val_fraction=getattr(args, "take_val_fraction", None),
         take_test_fraction=getattr(args, "take_test_fraction", None),
+
+        # NEW: pass-through toggles/knobs to data_loader
+        apply_padding=args.apply_padding,
+        out_size_when_padded=args.out_size_when_padded,
+        apply_normalization=args.apply_normalization,
+        clip_q=args.clip_q if (args.clip_q is None or args.clip_q >= 0) else None,
+        low_clip_q=args.low_clip_q,
+        use_mad=args.use_mad,
     )
 
     # Model
@@ -289,24 +264,21 @@ def main(args):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # --------- SCHEDULER (epoch-based, simple) ---------
     if args.cosine:
         warmup_epochs = max(0, args.warmup_epochs)
         total_epochs  = args.epochs
 
         def lr_lambda(epoch_idx: int):
-            # epoch_idx: 0,1,2,...
             if epoch_idx < warmup_epochs:
-                return (epoch_idx + 1) / max(1, warmup_epochs)   # linear warmup
+                return (epoch_idx + 1) / max(1, warmup_epochs)
             t = (epoch_idx - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-            return 0.5 * (1.0 + math.cos(math.pi * t))          # cosine decay
+            return 0.5 * (1.0 + math.cos(math.pi * t))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     else:
         scheduler = None
-    # ---------------------------------------------------
 
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler(device.type if device.type == "cuda" else "cpu")
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
 
     # Paths
@@ -318,34 +290,32 @@ def main(args):
     # CSV header
     with open(csv_log, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_auc", "lr"])
+        writer.writerow(["epoch", "train_loss", "train_acc",
+                         "val_loss", "val_acc", "val_auc", "lr"])
 
     # ---------------------------
     # Epoch loop
     # ---------------------------
     best_val = float("inf")
-    global_step = 0
     for epoch in range(1, args.epochs + 1):
         tic = time.time()
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scaler, device, criterion, args.log_every)
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, scaler, device, criterion, args.log_every
+        )
 
         val_loss, val_acc, val_auc = evaluate(model, val_loader, device, criterion, desc="Val")
 
-        # LR (assume first group)
         lr_now = optimizer.param_groups[0]["lr"]
 
-        # Save last
         torch.save({"model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch}, last_ckpt)
 
-        # Save best
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.state_dict(), best_ckpt)
             logger.info(f"✅ Epoch {epoch}: best model updated (val_loss={val_loss:.6f})")
 
-        # CSV append
         with open(csv_log, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([epoch, f"{train_loss:.6f}", f"{train_acc:.4f}",
@@ -359,19 +329,12 @@ def main(args):
             f"LR {lr_now:.2e} | {elapsed:.1f}s"
         )
 
-        # 🔽 epoch-based: step ONCE per epoch (simple)
         if scheduler is not None:
             scheduler.step()
 
         if early.step(val_loss):
             logger.info(f"⏹️ Early stopping at epoch {epoch}")
             break
-
-        # ❌ (삭제됨) 과거의 "배치 수만큼 몰아서 step" 블록은 제거했습니다.
-        # if args.cosine:
-        #     for _ in range(len(train_loader)):
-        #         scheduler.step()
-        #         global_step += 1
 
     # ---------------------------
     # Final evaluation on test set
@@ -381,6 +344,30 @@ def main(args):
         model.load_state_dict(torch.load(best_ckpt, map_location=device))
     test_loss, test_acc, test_auc = evaluate(model, test_loader, device, criterion, desc="Test")
     logger.info(f"✅ Test | Loss {test_loss:.4f} | Acc {test_acc:.2%} | AUC {test_auc:.4f}")
+
+    # Save a compact results file for cross-run comparison
+    results = {
+        "best_val_loss": best_val,
+        "test_loss": test_loss,
+        "test_acc": test_acc,
+        "test_auc": test_auc,
+        "config": {
+            "model_size": args.model_size,
+            "epochs": args.epochs,
+            "seed": args.seed,
+            "apply_padding": args.apply_padding,
+            "out_size_when_padded": args.out_size_when_padded,
+            "apply_normalization": args.apply_normalization,
+            "clip_q": args.clip_q if (args.clip_q is None or args.clip_q >= 0) else None,
+            "low_clip_q": args.low_clip_q,
+            "use_mad": args.use_mad,
+            "take_train_frac": args.take_train_frac,
+            "take_val_fraction": getattr(args, "take_val_fraction", None),
+            "take_test_fraction": getattr(args, "take_test_fraction", None),
+        }
+    }
+    with open(os.path.join(args.save_dir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2)
 
 
 # ---------------------------
@@ -400,8 +387,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers",       type=int, default=8)
     parser.add_argument("--no_augment",        action="store_true", help="Disable train-time rotation/flip")
     parser.add_argument("--take_train_frac",   type=float, default=None, help="e.g., 0.10 to use 10% of train only")
-    parser.add_argument("--take_val_fraction",   type=float, default=None, help="e.g., 0.10 to use 10% of train only")
-    parser.add_argument("--take_test_fraction",   type=float, default=None, help="e.g., 0.10 to use 10% of train only")
+    parser.add_argument("--take_val_fraction", type=float, default=None)
+    parser.add_argument("--take_test_fraction",type=float, default=None)
 
     # Split
     parser.add_argument("--train_frac",        type=float, default=0.70)
@@ -424,9 +411,29 @@ if __name__ == "__main__":
     parser.add_argument("--min_delta",         type=float, default=0.0)
     parser.add_argument("--seed",              type=int, default=42)
     parser.add_argument("--device",            type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--log_every",         type=int, default=200, help="Steps between loss prints in training")
 
     # Save
     parser.add_argument("--save_dir",          type=str, default="./checkpoints_convnextv2")
 
+    # === Preprocessing toggles (pass-through to data_loader) ===
+    parser.add_argument("--apply_padding", action="store_true",
+                        help="Center reflect-pad 41x41 -> out_size_when_padded (e.g., 64).")
+    parser.add_argument("--out_size_when_padded", type=int, default=64,
+                        help="Output size when padding is applied.")
+    parser.add_argument("--apply_normalization", action="store_true",
+                        help="Background subtraction -> (optional clip) -> z-score (or MAD).")
+    parser.add_argument("--clip_q", type=float, default=0.997,
+                        help="High-quantile clipping; set <0 to disable (plain z-score).")
+    parser.add_argument("--low_clip_q", type=float, default=None,
+                        help="Optional low-tail clipping quantile (e.g., 0.005).")
+    parser.add_argument("--use_mad", action="store_true",
+                        help="Use robust median/MAD instead of mean/std for z-score.")
+
     args = parser.parse_args()
+
+    # sanitize clip_q: allow negative to mean None
+    if args.clip_q is not None and args.clip_q < 0:
+        args.clip_q = None
+
     main(args)

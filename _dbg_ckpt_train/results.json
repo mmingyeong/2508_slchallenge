@@ -1,0 +1,20 @@
+{
+  "best_val_loss": 0.6788462870999387,
+  "test_loss": 0.681852428536666,
+  "test_acc": 0.5466666666666666,
+  "test_auc": 0.6354965234444643,
+  "config": {
+    "model_size": "atto",
+    "epochs": 5,
+    "seed": 42,
+    "apply_padding": true,
+    "out_size_when_padded": 64,
+    "apply_normalization": true,
+    "clip_q": 0.997,
+    "low_clip_q": null,
+    "use_mad": false,
+    "take_train_frac": 0.001,
+    "take_val_fraction": 0.001,
+    "take_test_fraction": 0.001
+  }
+}

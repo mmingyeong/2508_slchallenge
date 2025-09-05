@@ -1,0 +1,78 @@
+{
+  "env": {
+    "host": "anode11",
+    "python": "3.12.0",
+    "torch": "2.6.0+cu124",
+    "cuda_available": true,
+    "num_workers": 8
+  },
+  "inputs": {
+    "class_paths": {
+      "slsim_lenses": "/caefs/data/IllustrisTNG/slchallenge/slsim_lenses/slsim_lenses",
+      "slsim_nonlenses": "/caefs/data/IllustrisTNG/slchallenge/slsim_nonlenses/slsim_nonlenses",
+      "hsc_lenses": "/caefs/data/IllustrisTNG/slchallenge/hsc_lenses/hsc_lenses",
+      "hsc_nonlenses": "/caefs/data/IllustrisTNG/slchallenge/hsc_nonlenses/hsc_nonlenses"
+    },
+    "split": [
+      0.7,
+      0.15,
+      0.15
+    ],
+    "seed": 42,
+    "scan_fraction": 1.0,
+    "scan_limit": 0
+  },
+  "collection": {
+    "total_files": 1000000,
+    "labels": {
+      "1": 500000,
+      "0": 500000
+    },
+    "domains": {
+      "slsim": 500000,
+      "hsc": 500000
+    }
+  },
+  "scan": {
+    "scanned": 1000000,
+    "bad_files_count": 2,
+    "bad_files_list_path": "/caefs/user/mmingyeong/2508_slchallence/tune/_data_check/bad_files.txt"
+  },
+  "splits": {
+    "train": {
+      "N": 699999,
+      "labels": {
+        "1": 350000,
+        "0": 349999
+      },
+      "domains": {
+        "hsc": 349876,
+        "slsim": 350123
+      }
+    },
+    "val": {
+      "N": 150000,
+      "labels": {
+        "0": 75000,
+        "1": 75000
+      },
+      "domains": {
+        "hsc": 75109,
+        "slsim": 74891
+      }
+    },
+    "test": {
+      "N": 150001,
+      "labels": {
+        "1": 75000,
+        "0": 75001
+      },
+      "domains": {
+        "slsim": 74986,
+        "hsc": 75015
+      }
+    },
+    "sum_N": 1000000
+  },
+  "notes": "Use the same seed & split in all future experiments for comparability."
+}
