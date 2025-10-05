@@ -1,24 +1,59 @@
 # === General logs ===
 *.log
 logs/
+*.out
+*.err
 
 # === Python cache & environments ===
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .env
 .venv
+env/
+venv/
 
-# === Jupyter checkpoints ===
+# === Jupyter ===
 .ipynb_checkpoints/
+*.ipynb_convert/
 
-# === Large model & training files ===
+# === IDE / System ===
+.DS_Store
+.vscode/
+.idea/
+
+# === Model & training outputs ===
 *.pt
 *.pth
 *.ckpt
+checkpoints/
+outputs/
+runs/
+wandb/
+lightning_logs/
+res/
+tmp/
+*_pred_*/
 
-# === Datasets ===
+# === Final submission or intermediate results ===
+final/
+submission*.csv
+*.hdf5
+*.h5
+
+# === Data ===
+data/
 dataset/
+datasets/
 *.zip
 *.tar
 *.tar.gz
+*.npy
+*.npz
+
+# === Backup or temporary ===
+*.bak
+*.tmp
+*.swp
+*.swo

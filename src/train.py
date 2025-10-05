@@ -6,8 +6,18 @@ Training script for binary strong-lensing classification using ConvNeXt V2.
 - data_loader.py must provide `get_dataloaders(class_paths, ...)`
 - model.py must provide `convnextv2_atto/nano/tiny` (in_chans=1, num_classes=1)
 
-This version adds preprocessing toggles (padding / normalization) via CLI and
+This version adds preprocessing toggles (padding / normalization / smoothing) via CLI and
 saves a concise results.json for easy comparison across runs.
+
+Scheduler:
+  --scheduler {cosine, step, exp, plateau}
+    - cosine  : warmup + cosine annealing with LR floor (--warmup_epochs, --min_lr)
+    - step    : StepLR (--step_size, --gamma)
+    - exp     : ExponentialLR (--gamma)
+    - plateau : ReduceLROnPlateau (--plateau_factor, --plateau_patience, --plateau_cooldown, --min_lr, --plateau_monitor {loss,auc})
+
+Monitoring / Early Stopping:
+  --monitor {loss, auc}   # NEW: choose which validation metric to monitor for best checkpoint & early stopping
 """
 
 import os
@@ -99,17 +109,25 @@ def setup_logger(log_file: str | None = None,
 
 
 class EarlyStopping:
-    """Early stopping based on validation loss."""
-    def __init__(self, patience: int = 10, min_delta: float = 0.0):
+    """Early stopping based on a monitored validation metric."""
+    def __init__(self, patience: int = 10, min_delta: float = 0.0, mode: str = "min"):
+        assert mode in ("min", "max")
         self.patience = patience
         self.min_delta = min_delta
+        self.mode = mode
         self.counter = 0
-        self.best = float("inf")
+        self.best = -float("inf") if mode == "max" else float("inf")
         self.stop = False
 
-    def step(self, val_loss: float) -> bool:
-        if val_loss < self.best - self.min_delta:
-            self.best = val_loss
+    def improved(self, value: float) -> bool:
+        if self.mode == "min":
+            return value < self.best - self.min_delta
+        else:
+            return value > self.best + self.min_delta
+
+    def step(self, value: float) -> bool:
+        if self.improved(value):
+            self.best = value
             self.counter = 0
         else:
             self.counter += 1
@@ -139,7 +157,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, criterion, log_eve
 
     pbar = tqdm(loader, desc="Train", leave=False)
     for i, batch in enumerate(pbar, 1):
-        imgs, labels, _ = batch  # (B,1,H,W), (B,)
+        imgs, labels, _ = batch
+        if imgs.size(0) == 0:     # 안전장치: 빈 배치 스킵
+            continue
+
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.float().unsqueeze(1).to(device, non_blocking=True)
 
@@ -148,23 +169,29 @@ def train_one_epoch(model, loader, optimizer, scaler, device, criterion, log_eve
             logits = model(imgs)
             loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        # === 여기가 누락되어 있었음 ===
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        # ============================
 
         running_loss += loss.item()
 
         probs = torch.sigmoid(logits).detach().cpu().numpy().squeeze()
+        labels_np = labels.detach().cpu().numpy().squeeze()
+        probs = np.atleast_1d(probs); labels_np = np.atleast_1d(labels_np)
         preds = (probs > 0.5).astype(np.int32)
-        all_preds.append(preds)
-        all_labels.append(labels.detach().cpu().numpy().squeeze())
+        all_preds.append(preds); all_labels.append(labels_np)
 
         if i % log_every == 0:
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     all_preds = np.concatenate(all_preds) if len(all_preds) else np.array([])
     all_labels = np.concatenate(all_labels) if len(all_labels) else np.array([])
-
     acc = accuracy_score(all_labels, all_preds) if all_labels.size else 0.0
     avg_loss = running_loss / max(1, len(loader))
     return avg_loss, acc
@@ -181,16 +208,26 @@ def evaluate(model, loader, device, criterion, desc="Val"):
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.float().unsqueeze(1).to(device, non_blocking=True)
 
+        # evaluate() 내부
         with get_amp_ctx(device):
             logits = model(imgs)
             loss = criterion(logits, labels)
 
         running_loss += loss.item()
+
         probs = torch.sigmoid(logits).cpu().numpy().squeeze()
+        labels_np = labels.cpu().numpy().squeeze()
+
+        # NEW: 보강
+        probs = np.atleast_1d(probs)
+        labels_np = np.atleast_1d(labels_np)
+
         preds = (probs > 0.5).astype(np.int32)
+
         all_probs.append(probs)
         all_preds.append(preds)
-        all_labels.append(labels.cpu().numpy().squeeze())
+        all_labels.append(labels_np)
+
 
     all_probs = np.concatenate(all_probs) if len(all_probs) else np.array([])
     all_preds = np.concatenate(all_preds) if len(all_preds) else np.array([])
@@ -244,6 +281,12 @@ def main(args):
         clip_q=args.clip_q if (args.clip_q is None or args.clip_q >= 0) else None,
         low_clip_q=args.low_clip_q,
         use_mad=args.use_mad,
+
+        # NEW: smoothing options
+        smoothing_mode=args.smoothing_mode,          # "none" | "gaussian" | "guided"
+        gaussian_sigma=args.gaussian_sigma,
+        guided_radius=args.guided_radius,
+        guided_eps=args.guided_eps,
     )
 
     # Model
@@ -260,26 +303,52 @@ def main(args):
         drop_path_rate=args.drop_path,
     ).to(device)
 
-    # Loss / Optim / Scheduler
+    # Loss / Optim
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    if args.cosine:
-        warmup_epochs = max(0, args.warmup_epochs)
-        total_epochs  = args.epochs
+    # ---------------------------
+    # Scheduler (epoch-level; plateau monitors val metric)
+    # ---------------------------
+    scheduler = None
+    if args.scheduler == "cosine":
+        warmup_epochs = max(0, int(args.warmup_epochs))
+        total_epochs  = int(args.epochs)
+        base_lr = float(args.lr)
+        min_factor = float(args.min_lr) / max(base_lr, 1e-12)
 
         def lr_lambda(epoch_idx: int):
-            if epoch_idx < warmup_epochs:
-                return (epoch_idx + 1) / max(1, warmup_epochs)
-            t = (epoch_idx - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-            return 0.5 * (1.0 + math.cos(math.pi * t))
+            if warmup_epochs > 0 and epoch_idx < warmup_epochs:
+                return (epoch_idx + 1) / float(warmup_epochs)
+            t = (epoch_idx - warmup_epochs) / max(1.0, total_epochs - warmup_epochs)
+            t = min(max(t, 0.0), 1.0)
+            return min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * t))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    else:
-        scheduler = None
 
-    scaler = torch.amp.GradScaler(device.type if device.type == "cuda" else "cpu")
-    early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
+    elif args.scheduler == "step":
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=int(args.step_size), gamma=float(args.gamma))
+
+    elif args.scheduler == "exp":
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=float(args.gamma))
+
+    elif args.scheduler == "plateau":
+        mode = "min" if args.plateau_monitor == "loss" else "max"
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=mode,
+            factor=float(args.plateau_factor),
+            patience=int(args.plateau_patience),
+            cooldown=int(args.plateau_cooldown),
+            min_lr=float(args.min_lr),
+            threshold=1e-4,
+            verbose=False,
+        )
+
+    # Early stopping & checkpointing based on selected monitor
+    monitor_mode = "min" if args.monitor == "loss" else "max"
+    early = EarlyStopping(patience=args.patience, min_delta=args.min_delta, mode=monitor_mode)
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Paths
     os.makedirs(args.save_dir, exist_ok=True)
@@ -296,7 +365,6 @@ def main(args):
     # ---------------------------
     # Epoch loop
     # ---------------------------
-    best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         tic = time.time()
         train_loss, train_acc = train_one_epoch(
@@ -304,18 +372,28 @@ def main(args):
         )
 
         val_loss, val_acc, val_auc = evaluate(model, val_loader, device, criterion, desc="Val")
-
         lr_now = optimizer.param_groups[0]["lr"]
 
+        # save "last"
         torch.save({"model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch}, last_ckpt)
 
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(model.state_dict(), best_ckpt)
-            logger.info(f"✅ Epoch {epoch}: best model updated (val_loss={val_loss:.6f})")
+        # determine monitored value
+        monitored_value = val_loss if args.monitor == "loss" else (val_auc if not math.isnan(val_auc) else float("-inf"))
+        improved = early.improved(monitored_value)
 
+        # checkpoint on improvement
+        if improved:
+            torch.save(model.state_dict(), best_ckpt)
+            if args.monitor == "loss":
+                logger.info(f"✅ Epoch {epoch}: best model updated (val_loss={val_loss:.6f})"
+                            + (f", val_auc={val_auc:.6f}" if not math.isnan(val_auc) else ""))
+            else:
+                logger.info(f"✅ Epoch {epoch}: best model updated (val_auc={val_auc:.6f})"
+                            + f", val_loss={val_loss:.6f}")
+
+        # log to CSV
         with open(csv_log, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([epoch, f"{train_loss:.6f}", f"{train_acc:.4f}",
@@ -329,12 +407,25 @@ def main(args):
             f"LR {lr_now:.2e} | {elapsed:.1f}s"
         )
 
+        # Step scheduler (epoch-level)
         if scheduler is not None:
-            scheduler.step()
+            if args.scheduler == "plateau":
+                metric = val_loss if args.plateau_monitor == "loss" else (val_auc if not math.isnan(val_auc) else 0.5)
+                scheduler.step(metric)
+            else:
+                scheduler.step()
 
-        if early.step(val_loss):
-            logger.info(f"⏹️ Early stopping at epoch {epoch}")
+        # early stopping (after checkpointing decision)
+        if early.step(monitored_value):
+            logger.info(f"⏹️ Early stopping at epoch {epoch} (monitor={args.monitor}, best={early.best:.6f})")
             break
+
+    # epoch loop 종료 직후, test 평가 전에 추가
+    if not os.path.exists(best_ckpt):
+        # 폴백: 마지막 가중치를 best로 저장
+        torch.save(model.state_dict(), best_ckpt)
+        logger.WARNING("No best checkpoint was saved; falling back to last checkpoint as best.")
+
 
     # ---------------------------
     # Final evaluation on test set
@@ -347,7 +438,10 @@ def main(args):
 
     # Save a compact results file for cross-run comparison
     results = {
-        "best_val_loss": best_val,
+        # keep both keys for convenience
+        "best_val_loss": early.best if args.monitor == "loss" else None,
+        "best_val_auc":  early.best if args.monitor == "auc"  else None,
+        "monitor": args.monitor,
         "test_loss": test_loss,
         "test_acc": test_acc,
         "test_auc": test_auc,
@@ -355,12 +449,34 @@ def main(args):
             "model_size": args.model_size,
             "epochs": args.epochs,
             "seed": args.seed,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "scheduler": args.scheduler,
+            # cosine
+            "warmup_epochs": args.warmup_epochs,
+            "min_lr": args.min_lr,
+            # step/exp
+            "step_size": args.step_size,
+            "gamma": args.gamma,
+            # plateau
+            "plateau_factor": args.plateau_factor,
+            "plateau_patience": args.plateau_patience,
+            "plateau_cooldown": args.plateau_cooldown,
+            "plateau_monitor": args.plateau_monitor,
+            # preprocessing
             "apply_padding": args.apply_padding,
             "out_size_when_padded": args.out_size_when_padded,
             "apply_normalization": args.apply_normalization,
             "clip_q": args.clip_q if (args.clip_q is None or args.clip_q >= 0) else None,
             "low_clip_q": args.low_clip_q,
             "use_mad": args.use_mad,
+            # smoothing
+            "smoothing_mode": args.smoothing_mode,
+            "gaussian_sigma": args.gaussian_sigma,
+            "guided_radius": args.guided_radius,
+            "guided_eps": args.guided_eps,
+            # sampling
             "take_train_frac": args.take_train_frac,
             "take_val_fraction": getattr(args, "take_val_fraction", None),
             "take_test_fraction": getattr(args, "take_test_fraction", None),
@@ -402,8 +518,31 @@ if __name__ == "__main__":
     # Optim
     parser.add_argument("--lr",                type=float, default=3e-4)
     parser.add_argument("--weight_decay",      type=float, default=5e-2)
-    parser.add_argument("--cosine",            action="store_true", help="Use cosine LR with warmup")
-    parser.add_argument("--warmup_epochs",     type=int, default=2)
+
+    # Scheduler selection (no legacy --cosine)
+    parser.add_argument("--scheduler", type=str, default="cosine",
+                        choices=["cosine", "step", "exp", "plateau"],
+                        help="LR scheduler type.")
+    # Cosine
+    parser.add_argument("--warmup_epochs", type=int, default=2,
+                        help="Warmup epochs for cosine.")
+    parser.add_argument("--min_lr",       type=float, default=1e-6,
+                        help="LR floor for cosine/plateau.")
+    # Step/Exp
+    parser.add_argument("--step_size", type=int,   default=20,
+                        help="Step size (epochs) for StepLR.")
+    parser.add_argument("--gamma",     type=float, default=0.5,
+                        help="Decay factor for StepLR/ExponentialLR.")
+    # Plateau
+    parser.add_argument("--plateau_factor",   type=float, default=0.5,
+                        help="LR multiply factor on plateau.")
+    parser.add_argument("--plateau_patience", type=int,   default=3,
+                        help="Plateau patience (epochs).")
+    parser.add_argument("--plateau_cooldown", type=int,   default=0,
+                        help="Cooldown (epochs) after LR reduction.")
+    parser.add_argument("--plateau_monitor",  type=str,   default="loss",
+                        choices=["loss", "auc"],
+                        help="Metric to monitor for plateau scheduling.")
 
     # Train
     parser.add_argument("--epochs",            type=int, default=20)
@@ -416,9 +555,14 @@ if __name__ == "__main__":
     # Save
     parser.add_argument("--save_dir",          type=str, default="./checkpoints_convnextv2")
 
+    # === Monitoring (NEW) ===
+    parser.add_argument("--monitor",           type=str, default="loss",
+                        choices=["loss", "auc"],
+                        help="Metric to monitor for best checkpoint & early stopping.")
+
     # === Preprocessing toggles (pass-through to data_loader) ===
     parser.add_argument("--apply_padding", action="store_true",
-                        help="Center reflect-pad 41x41 -> out_size_when_padded (e.g., 64).")
+                        help="Center pad 41x41 -> out_size_when_padded (e.g., 64).")
     parser.add_argument("--out_size_when_padded", type=int, default=64,
                         help="Output size when padding is applied.")
     parser.add_argument("--apply_normalization", action="store_true",
@@ -429,6 +573,17 @@ if __name__ == "__main__":
                         help="Optional low-tail clipping quantile (e.g., 0.005).")
     parser.add_argument("--use_mad", action="store_true",
                         help="Use robust median/MAD instead of mean/std for z-score.")
+
+    # === NEW: Smoothing options ===
+    parser.add_argument("--smoothing_mode", type=str, default="none",
+                        choices=["none", "gaussian", "guided"],
+                        help="Per-image smoothing before padding: none | gaussian | guided.")
+    parser.add_argument("--gaussian_sigma", type=float, default=0.8,
+                        help="Gaussian smoothing sigma (in pixels).")
+    parser.add_argument("--guided_radius", type=int, default=2,
+                        help="Guided filter radius (window radius in pixels).")
+    parser.add_argument("--guided_eps", type=float, default=1e-2,
+                        help="Guided filter regularization eps (intensity^2 units).")
 
     args = parser.parse_args()
 

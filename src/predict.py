@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Predict / evaluate script for binary strong-lensing classification using ConvNeXt V2.
+
+Now supports passing preprocessing toggles to data_loader:
+- padding: --apply_padding, --out_size_when_padded
+- normalization: --apply_normalization, --clip_q, --low_clip_q, --use_mad
+- smoothing: --smoothing_mode {none,gaussian,guided}, --gaussian_sigma, --guided_radius, --guided_eps
 """
 
 import os
@@ -57,11 +62,10 @@ def run_inference(
     all_paths, all_domains = [], []
 
     pbar = tqdm(loader, desc=desc, leave=False)
-    amp_ctx = torch.amp.autocast("cuda") if device.type == "cuda" else nullcontext()
+    amp_ctx = torch.amp.autocast(device_type=device.type) if device.type == "cuda" else nullcontext()
 
     seen = 0
     for imgs, labels, metas in pbar:
-        # limit early if max_samples is small and we already have enough
         if max_samples is not None and seen >= max_samples:
             break
 
@@ -75,12 +79,10 @@ def run_inference(
         preds = (probs > 0.5).astype(np.int32)
         ys    = labels.cpu().numpy().squeeze()
 
-        # batch-size가 1일 수도 있으니 일괄적으로 np.atleast_1d 적용
         probs = np.atleast_1d(probs)
         preds = np.atleast_1d(preds)
         ys    = np.atleast_1d(ys)
 
-        # 남은 quota만큼만 취득
         if max_samples is not None:
             remain = max_samples - seen
             if probs.shape[0] > remain:
@@ -93,7 +95,6 @@ def run_inference(
         all_preds.append(preds)
         all_labels.append(ys)
 
-        # safe_collate → metas is list[dict]
         for m in metas:
             all_paths.append(m["path"])
             all_domains.append(m["domain"])
@@ -104,7 +105,6 @@ def run_inference(
     probs  = np.concatenate(all_probs)  if all_probs  else np.array([])
     preds  = np.concatenate(all_preds)  if all_preds  else np.array([])
 
-    # 혹시라도 길이 불일치 방지
     n = min(len(labels), len(probs), len(preds), len(all_paths), len(all_domains))
     return labels[:n], probs[:n], preds[:n], all_paths[:n], all_domains[:n]
 
@@ -134,6 +134,21 @@ def main(args):
         "hsc_nonlenses": args.hsc_nonlenses,
     }
     logger.info("📦 Building dataloaders...")
+
+    # ----- SAFE READ of optional smoothing args -----
+    smoothing_mode_raw = getattr(args, "smoothing_mode", "none")
+    smoothing_mode = None if (smoothing_mode_raw is None or str(smoothing_mode_raw).lower() == "none") \
+                     else str(smoothing_mode_raw).lower()
+
+    gaussian_sigma = float(getattr(args, "gaussian_sigma", 1.0))
+    guided_radius  = int(getattr(args, "guided_radius", 2))
+    guided_eps     = float(getattr(args, "guided_eps", 1e-3))
+
+    # clip_q 음수 → None
+    clip_q = getattr(args, "clip_q", 0.997)
+    if clip_q is not None and clip_q < 0:
+        clip_q = None
+
     train_loader, val_loader, test_loader = get_dataloaders(
         class_paths=class_paths,
         batch_size=args.batch_size,
@@ -142,10 +157,22 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
         augment_train=False,  # prediction → no augment
-        # 디버그용 샘플링 전달
+        # debug sampling
         take_train_fraction=getattr(args, "take_train_fraction", None),
         take_val_fraction=getattr(args, "take_val_fraction", None),
         take_test_fraction=getattr(args, "take_test_fraction", None),
+        # --- preprocessing toggles (pass-through) ---
+        apply_padding=getattr(args, "apply_padding", False),
+        out_size_when_padded=getattr(args, "out_size_when_padded", 64),
+        apply_normalization=getattr(args, "apply_normalization", False),
+        clip_q=clip_q,
+        low_clip_q=getattr(args, "low_clip_q", None),
+        use_mad=getattr(args, "use_mad", False),
+        # smoothing
+        smoothing_mode=smoothing_mode,            # None | "gaussian" | "guided"
+        gaussian_sigma=gaussian_sigma,
+        guided_radius=guided_radius,
+        guided_eps=guided_eps,
     )
     logger.info(f"Split sizes -> train:{len(train_loader.dataset)}  "
                 f"val:{len(val_loader.dataset)}  test:{len(test_loader.dataset)}")
@@ -216,14 +243,14 @@ if __name__ == "__main__":
     # Which split
     parser.add_argument("--which",             type=str, default="test",
                         help="train | val | test | all")
-    # Loader
+    # Loader (split)
     parser.add_argument("--batch_size",        type=int, default=128)
     parser.add_argument("--num_workers",       type=int, default=8)
     parser.add_argument("--train_frac",        type=float, default=0.70)
     parser.add_argument("--val_frac",          type=float, default=0.15)
     parser.add_argument("--test_frac",         type=float, default=0.15)
     parser.add_argument("--seed",              type=int, default=42)
-    # 디버그 서브샘플링
+    # Debug subsampling
     parser.add_argument("--take_train_fraction", type=float, default=None)
     parser.add_argument("--take_val_fraction",   type=float, default=None)
     parser.add_argument("--take_test_fraction",  type=float, default=None)
@@ -234,7 +261,39 @@ if __name__ == "__main__":
     # Runtime
     parser.add_argument("--device",            type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir",        type=str, default="./pred_outputs")
-    # 최대 N개만 추론 (split별)
     parser.add_argument("--max_samples",       type=int, default=None)
+
+    # ===== Preprocessing toggles (pass-through to data_loader) =====
+    # Padding
+    parser.add_argument("--apply_padding", action="store_true",
+                        help="Center pad 41x41 -> out_size_when_padded (constant background).")
+    parser.add_argument("--out_size_when_padded", type=int, default=64)
+
+    # Normalization
+    parser.add_argument("--apply_normalization", action="store_true",
+                        help="Background subtraction -> (optional clip) -> z-score (or MAD).")
+    parser.add_argument("--clip_q", type=float, default=0.997,
+                        help="High-quantile clipping; set <0 to disable (plain z-score).")
+    parser.add_argument("--low_clip_q", type=float, default=None,
+                        help="Optional low-tail clipping quantile (e.g., 0.005).")
+    parser.add_argument("--use_mad", action="store_true",
+                        help="Use robust median/MAD instead of mean/std for z-score.")
+
+    # Smoothing
+    parser.add_argument("--smoothing_mode", type=str, default="none",
+                        choices=["none", "gaussian", "guided"],
+                        help="Apply smoothing before padding: none | gaussian | guided.")
+    parser.add_argument("--gaussian_sigma", type=float, default=1.0,
+                        help="Gaussian sigma in pixels (only if smoothing_mode=gaussian).")
+    parser.add_argument("--guided_radius",  type=int,   default=2,
+                        help="Guided filter radius in pixels (only if smoothing_mode=guided).")
+    parser.add_argument("--guided_eps",     type=float, default=1e-3,
+                        help="Guided filter regularization epsilon (only if smoothing_mode=guided).")
+
+
     args = parser.parse_args()
+
+    if args.clip_q is not None and args.clip_q < 0:
+        args.clip_q = None
+
     main(args)

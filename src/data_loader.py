@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 Strong-lensing binary classification loader with independent toggles:
-- apply_padding: center reflect-pad 41x41 -> out_size_when_padded (default 64)
+- apply_padding: center constant-pad 41x41 -> out_size_when_padded (default 64)
 - apply_normalization: background subtraction -> (optional) high-quantile clip -> z-score (or MAD)
-
-If apply_normalization=False, the raw 41x41 values are used (float32).
-If apply_padding=False, spatial size stays 41x41.
+- smoothing: one of {none, gaussian, guided, psf} applied BEFORE normalization and BEFORE padding
+...
+- Smoothing is applied on the original 41x41 grid (not on padded images), BEFORE normalization.
 """
+
 
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
-import logging, warnings, random
+import logging, warnings, random, math
 
 import numpy as np
 import torch
@@ -155,6 +156,76 @@ def _read_fits_image_41x41(fits_path: str):
         return None
 
 
+# ---------------- smoothing utilities ----------------
+
+def _gaussian_kernel1d(sigma: float, truncate: float = 3.0) -> torch.Tensor:
+    """Return 1D Gaussian kernel normalized to sum=1 (dtype=float32)."""
+    sigma = float(max(sigma, 1e-6))
+    radius = int(math.ceil(truncate * sigma))
+    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    weights = torch.exp(-0.5 * (x / sigma) ** 2)
+    weights /= weights.sum().clamp_min(1e-12)
+    return weights  # (K,)
+
+def _gaussian_blur_2d(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """
+    Separable Gaussian blur for a single-channel 2D tensor x (H,W) -> (H,W).
+    """
+    if sigma <= 0:
+        return x
+    k1d = _gaussian_kernel1d(sigma)  # (K,)
+    Kh = k1d.view(1, 1, 1, -1)       # horizontal
+    Kv = k1d.view(1, 1, -1, 1)       # vertical
+    x4 = x.unsqueeze(0).unsqueeze(0) # (1,1,H,W)
+    xh = F.conv2d(x4, Kh, padding=(0, Kh.shape[-1]//2))
+    xv = F.conv2d(xh, Kv, padding=(Kv.shape[-2]//2, 0))
+    return xv.squeeze(0).squeeze(0)
+
+def _box_filter(x4: torch.Tensor, r: int) -> torch.Tensor:
+    """
+    Box filter by conv2d (batch,1,H,W) with kernel size (2r+1).
+    Returns same shape as x4. No normalization (raw sum).
+    """
+    k = 2 * r + 1
+    weight = torch.ones((1, 1, k, k), dtype=x4.dtype, device=x4.device)
+    return F.conv2d(x4, weight, padding=r)
+
+def _guided_filter_self(x: torch.Tensor, r: int, eps: float) -> torch.Tensor:
+    """
+    Self-guided filter (gray-scale). x: (H,W) float tensor.
+    Implements He et al. guided filter with I = p = x.
+    """
+    H, W = x.shape
+    x4 = x.view(1, 1, H, W)
+    N = _box_filter(torch.ones_like(x4), r)  # window size per pixel
+
+    mean_x = _box_filter(x4, r) / N
+    mean_xx = _box_filter(x4 * x4, r) / N
+    var_x = (mean_xx - mean_x * mean_x).clamp_min(0.0)
+
+    a = var_x / (var_x + eps)
+    b = mean_x - a * mean_x
+
+    mean_a = _box_filter(a, r) / N
+    mean_b = _box_filter(b, r) / N
+
+    q = mean_a * x4 + mean_b
+    return q.view(H, W)
+
+def _fwhm_to_sigma(fwhm: float) -> float:
+    return float(fwhm) / 2.354820045  # 2*sqrt(2*ln2)
+
+def _psf_sigma_kernel(current_sigma: float, target_sigma: float) -> float:
+    """
+    Given current PSF sigma and target PSF sigma (both in pixels),
+    return required Gaussian kernel sigma to homogenize: sigma_k = sqrt(target^2 - current^2),
+    clipped at 0 if target <= current.
+    """
+    if target_sigma <= current_sigma:
+        return 0.0
+    return float(math.sqrt(max(target_sigma**2 - current_sigma**2, 0.0)))
+
+
 # ---------------- Dataset ----------------
 class LensFITSBinaryDataset(Dataset):
     def __init__(
@@ -165,20 +236,33 @@ class LensFITSBinaryDataset(Dataset):
         augment: bool = False,
         eps: float = 1e-6,
         # independent toggles
-        apply_padding: bool = True,
+        apply_padding: bool = False,
         out_size_when_padded: int = 64,
         apply_normalization: bool = True,
         clip_q: Optional[float] = 0.997,       # None -> no clipping, just z-score
         low_clip_q: Optional[float] = None,    # e.g., 0.005 if needed
         use_mad: bool = False,                 # robust normalization via median/MAD
+        # smoothing
+        smoothing_mode: str = "none",          # {"none","gaussian","guided","psf"}
+        gaussian_sigma: float = 0.8,           # in pixels on 41x41
+        guided_radius: int = 2,                # window radius r (window size = 2r+1)
+        guided_eps: float = 1e-2,              # regularization (in image intensity^2)
+        psf_target_fwhm: Optional[float] = None,               # in pixels
+        psf_input_fwhm_by_domain: Optional[Dict[str, float]] = None,  # {"hsc":..., "slsim":...}
     ):
         """
         apply_padding:
-            True  -> reflect-pad to out_size_when_padded (default 64)
+            True  -> constant-pad to out_size_when_padded (default 64)
             False -> keep 41x41
         apply_normalization:
             True  -> background subtraction -> (optional) high-quantile clip -> z-score (or MAD)
             False -> raw values (float32), no normalization
+        smoothing:
+            Applied AFTER normalization, BEFORE padding.
+            - "none": no smoothing
+            - "gaussian": Gaussian blur with gaussian_sigma (pixels)
+            - "guided": self-guided filter with guided_radius r and guided_eps
+            - "psf": Gaussian convolution to reach psf_target_fwhm per domain
         """
         assert len(files) == len(labels) == len(domains)
         self.files = files
@@ -194,29 +278,54 @@ class LensFITSBinaryDataset(Dataset):
         self.low_clip_q = low_clip_q
         self.use_mad = use_mad
 
+        # smoothing params
+        self.smoothing_mode = (smoothing_mode or "none").lower()
+        assert self.smoothing_mode in {"none", "gaussian", "guided", "psf"}
+        self.gaussian_sigma = float(gaussian_sigma)
+        self.guided_radius = int(guided_radius)
+        self.guided_eps = float(guided_eps)
+        self.psf_target_fwhm = psf_target_fwhm
+        self.psf_input_fwhm_by_domain = psf_input_fwhm_by_domain or {}
+
         n_lens = int(np.sum(labels))
         out_h = out_size_when_padded if apply_padding else 41
         logger.info(
-            "Dataset: N=%d | lens=%d | nonlens=%d | augment=%s | padding=%s(out=%d) | normalization=%s | clip_q=%s",
+            "Dataset: N=%d | lens=%d | nonlens=%d | augment=%s | padding=%s(out=%d) | "
+            "normalization=%s | clip_q=%s | smoothing=%s",
             len(files), n_lens, len(files)-n_lens, augment,
-            apply_padding, out_h, apply_normalization, str(clip_q)
+            apply_padding, out_h, apply_normalization, str(clip_q), self.smoothing_mode
         )
 
     def __len__(self): return len(self.files)
 
     @staticmethod
     def _augment(img: torch.Tensor) -> torch.Tensor:
+        # 1. 기본 대칭 변환 (현재 유지)
         k = random.randint(0, 3)
         img = torch.rot90(img, k, dims=(-2, -1))
         if random.random() < 0.5: img = torch.flip(img, dims=[-1])
         if random.random() < 0.5: img = torch.flip(img, dims=[-2])
-        return img
 
+        # 2. 현실적인 노이즈/밝기 변환 추가
+        if random.random() < 0.5:
+            # 가우시안 노이즈 추가 (데이터셋의 통계에 맞게 std 조정 필요)
+            noise = torch.randn_like(img) * 0.01 
+            img = img + noise
+
+        if random.random() < 0.5:
+            # 밝기 및 대비 조절 (예: 무작위 감마 보정)
+            gamma = random.uniform(0.8, 1.2)
+            img = torch.pow(img.clamp(min=1e-6), gamma) # clamp로 0 나누기 방지
+
+        return img
+    
     def _normalize(self, img: torch.Tensor) -> torch.Tensor:
         """
         Background subtraction -> optional high-quantile clip -> z-score (or MAD).
-        Operates on 41x41; padding (if any) is applied afterward.
+        Operates on 41x41; smoothing (if any) is applied beforehand.
         """
+
+
         x = img.clone()
 
         # (1) Background subtraction: median of lowest 20% pixels
@@ -249,6 +358,40 @@ class LensFITSBinaryDataset(Dataset):
 
         return x
 
+    def _apply_smoothing(self, x: torch.Tensor, domain: str) -> torch.Tensor:
+        """
+        Apply smoothing on (41,41) tensor AFTER normalization, BEFORE padding.
+        """
+        mode = self.smoothing_mode
+        if mode == "none":
+            return x
+
+        if mode == "gaussian":
+            return _gaussian_blur_2d(x, self.gaussian_sigma)
+
+        if mode == "guided":
+            r = max(1, self.guided_radius)
+            eps = max(1e-8, self.guided_eps)
+            return _guided_filter_self(x, r=r, eps=eps)
+
+        if mode == "psf":
+            # require target fwhm and per-domain input fwhm
+            if self.psf_target_fwhm is None:
+                return x
+            target_sigma = _fwhm_to_sigma(self.psf_target_fwhm)
+            current_fwhm = self.psf_input_fwhm_by_domain.get(str(domain).lower(), None)
+            if current_fwhm is None:
+                # if missing domain info, skip (no blur) to avoid over-smoothing
+                return x
+            current_sigma = _fwhm_to_sigma(current_fwhm)
+            sigma_k = _psf_sigma_kernel(current_sigma, target_sigma)
+            if sigma_k <= 0:
+                return x
+            return _gaussian_blur_2d(x, sigma_k)
+
+        # fallback
+        return x
+
     def _maybe_pad(self, x: torch.Tensor, bg_value: float = 0.0) -> torch.Tensor:
         if not self.apply_padding:
             return x
@@ -271,14 +414,22 @@ class LensFITSBinaryDataset(Dataset):
             if img is None or (not torch.isfinite(img).all()):
                 raise ValueError(f"Skipping corrupted file: {fp}")
 
-            if self.apply_normalization:
-                x = self._normalize(img)       # (41,41), normalized
-            else:
-                x = img.to(torch.float32)      # raw 41x41
+            # start from raw float
+            x = img.to(torch.float32)          # (41,41) raw
 
+            # 1) smoothing (BEFORE normalization)
+            x = self._apply_smoothing(x, domain=domain)
+
+            # 2) normalization
+            if self.apply_normalization:
+                x = self._normalize(x)         # normalize the smoothed image
+
+
+            # padding (after smoothing)
             x = self._maybe_pad(x)             # (41,41) or (64,64)
             x = x.unsqueeze(0).to(torch.float32)
 
+            # optional augmentation
             if self.augment:
                 x = self._augment(x)
 
@@ -300,13 +451,20 @@ def get_dataloaders(
     take_train_fraction: Optional[float] = None,
     take_val_fraction: Optional[float] = None,
     take_test_fraction: Optional[float] = None,
-    # toggles & knobs
-    apply_padding: bool = True,
+    # toggles & knobs (padding/normalization)
+    apply_padding: bool = False,
     out_size_when_padded: int = 64,
     apply_normalization: bool = True,
     clip_q: Optional[float] = 0.997,
     low_clip_q: Optional[float] = None,
     use_mad: bool = False,
+    # smoothing knobs
+    smoothing_mode: str = "none",            # {"none","gaussian","guided","psf"}
+    gaussian_sigma: float = 0.8,
+    guided_radius: int = 2,
+    guided_eps: float = 1e-2,
+    psf_target_fwhm: Optional[float] = None,
+    psf_input_fwhm_by_domain: Optional[Dict[str, float]] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     IMPORTANT: For fair evaluation, keep the same toggles for train/val/test.
@@ -356,6 +514,13 @@ def get_dataloaders(
         clip_q=clip_q,
         low_clip_q=low_clip_q,
         use_mad=use_mad,
+        # smoothing
+        smoothing_mode=smoothing_mode,
+        gaussian_sigma=gaussian_sigma,
+        guided_radius=guided_radius,
+        guided_eps=guided_eps,
+        psf_target_fwhm=psf_target_fwhm,
+        psf_input_fwhm_by_domain=psf_input_fwhm_by_domain,
     )
 
     ds_tr = LensFITSBinaryDataset(
@@ -377,7 +542,10 @@ def get_dataloaders(
     out_size = out_size_when_padded if apply_padding else 41
     collate_fn = make_safe_collate(out_size)
 
-    logger.info(f"Split | Train={len(ds_tr)} | Val={len(ds_va)} | Test={len(ds_te)} | batch={batch_size} | out_size={out_size}")
+    logger.info(
+        "Split | Train=%d | Val=%d | Test=%d | batch=%d | out_size=%d | smoothing=%s",
+        len(ds_tr), len(ds_va), len(ds_te), batch_size, out_size, smoothing_mode
+    )
 
     train_loader = DataLoader(
         ds_tr, batch_size=batch_size, shuffle=True,
