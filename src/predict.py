@@ -7,6 +7,10 @@ Now supports passing preprocessing toggles to data_loader:
 - padding: --apply_padding, --out_size_when_padded
 - normalization: --apply_normalization, --clip_q, --low_clip_q, --use_mad
 - smoothing: --smoothing_mode {none,gaussian,guided}, --gaussian_sigma, --guided_radius, --guided_eps
+
+NEW:
+- Accepts either directory inputs (--slsim_lenses, ...) or manifest list files
+  (--slsim_lenses_list, ...) for large-scale inference without creating symlinks.
 """
 
 import os
@@ -120,20 +124,50 @@ def build_model(model_size: str, drop_path: float, device: torch.device) -> torc
 
 
 # ---------------------------
+# Utilities for dir-or-list inputs
+# ---------------------------
+def _read_list(path: Optional[str]) -> Optional[List[str]]:
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        items = [ln.strip() for ln in f if ln.strip()]
+    return items or None
+
+
+def _validate_dir_or_list(logger: logging.Logger, class_dirs: Dict[str, Optional[str]],
+                          class_lists: Dict[str, Optional[List[str]]]) -> None:
+    """Ensure each class has at least one source (dir or list)."""
+    for k in ("slsim_lenses", "slsim_nonlenses", "hsc_lenses", "hsc_nonlenses"):
+        if not (class_dirs.get(k) or class_lists.get(k)):
+            raise ValueError(f"Provide either --{k} (directory) or --{k}_list (manifest).")
+    # Informative logging
+    for k in class_dirs:
+        src = f"LIST({len(class_lists[k])})" if class_lists.get(k) else f"DIR({class_dirs.get(k)})"
+        logger.info(f"Input source for {k}: {src}")
+
+
+# ---------------------------
 # Main
 # ---------------------------
 def main(args):
     logger = setup_logger(os.path.join(args.output_dir, "predict.log"))
     device = torch.device(args.device)
 
-    # Build dataloaders (same split as train)
-    class_paths: Dict[str, str] = {
-        "slsim_lenses": args.slsim_lenses,
+    # Gather dir-or-list sources
+    class_dirs: Dict[str, Optional[str]] = {
+        "slsim_lenses":    args.slsim_lenses,
         "slsim_nonlenses": args.slsim_nonlenses,
-        "hsc_lenses": args.hsc_lenses,
-        "hsc_nonlenses": args.hsc_nonlenses,
+        "hsc_lenses":      args.hsc_lenses,
+        "hsc_nonlenses":   args.hsc_nonlenses,
     }
-    logger.info("📦 Building dataloaders...")
+    class_lists: Dict[str, Optional[List[str]]] = {
+        "slsim_lenses":    _read_list(args.slsim_lenses_list),
+        "slsim_nonlenses": _read_list(args.slsim_nonlenses_list),
+        "hsc_lenses":      _read_list(args.hsc_lenses_list),
+        "hsc_nonlenses":   _read_list(args.hsc_nonlenses_list),
+    }
+    _validate_dir_or_list(logger, class_dirs, class_lists)
+    logger.info("📦 Building dataloaders (dir-or-list)…")
 
     # ----- SAFE READ of optional smoothing args -----
     smoothing_mode_raw = getattr(args, "smoothing_mode", "none")
@@ -149,8 +183,10 @@ def main(args):
     if clip_q is not None and clip_q < 0:
         clip_q = None
 
+    # IMPORTANT: requires data_loader.get_dataloaders signature updated accordingly.
     train_loader, val_loader, test_loader = get_dataloaders(
-        class_paths=class_paths,
+        class_dirs=class_dirs,                 # NEW
+        class_lists=class_lists,               # NEW
         batch_size=args.batch_size,
         split=(args.train_frac, args.val_frac, args.test_frac),
         seed=args.seed,
@@ -235,14 +271,31 @@ def main(args):
 # ---------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Predict/evaluate ConvNeXt V2 on FITS (binary classification)")
-    # Data dirs
-    parser.add_argument("--slsim_lenses",      type=str, required=True)
-    parser.add_argument("--slsim_nonlenses",   type=str, required=True)
-    parser.add_argument("--hsc_lenses",        type=str, required=True)
-    parser.add_argument("--hsc_nonlenses",     type=str, required=True)
+
+    # --- Data dirs (optional; dir-or-list model) ---
+    parser.add_argument("--slsim_lenses",      type=str, required=False,
+                        help="Directory of SLSim lenses (if not using *_list).")
+    parser.add_argument("--slsim_nonlenses",   type=str, required=False,
+                        help="Directory of SLSim non-lenses (if not using *_list).")
+    parser.add_argument("--hsc_lenses",        type=str, required=False,
+                        help="Directory of HSC lenses (if not using *_list).")
+    parser.add_argument("--hsc_nonlenses",     type=str, required=False,
+                        help="Directory of HSC non-lenses (if not using *_list).")
+
+    # --- NEW: manifest (one path per line) ---
+    parser.add_argument("--slsim_lenses_list",    type=str, default=None,
+                        help="Text file: one FITS path per line for SLSim lenses.")
+    parser.add_argument("--slsim_nonlenses_list", type=str, default=None,
+                        help="Text file: one FITS path per line for SLSim non-lenses.")
+    parser.add_argument("--hsc_lenses_list",      type=str, default=None,
+                        help="Text file: one FITS path per line for HSC lenses.")
+    parser.add_argument("--hsc_nonlenses_list",   type=str, default=None,
+                        help="Text file: one FITS path per line for HSC non-lenses.")
+
     # Which split
     parser.add_argument("--which",             type=str, default="test",
                         help="train | val | test | all")
+
     # Loader (split)
     parser.add_argument("--batch_size",        type=int, default=128)
     parser.add_argument("--num_workers",       type=int, default=8)
@@ -250,14 +303,17 @@ if __name__ == "__main__":
     parser.add_argument("--val_frac",          type=float, default=0.15)
     parser.add_argument("--test_frac",         type=float, default=0.15)
     parser.add_argument("--seed",              type=int, default=42)
+
     # Debug subsampling
     parser.add_argument("--take_train_fraction", type=float, default=None)
     parser.add_argument("--take_val_fraction",   type=float, default=None)
     parser.add_argument("--take_test_fraction",  type=float, default=None)
+
     # Model
     parser.add_argument("--model_path",        type=str, required=True)
     parser.add_argument("--model_size",        type=str, default="atto", choices=["atto", "nano", "tiny"])
     parser.add_argument("--drop_path",         type=float, default=0.0)
+
     # Runtime
     parser.add_argument("--device",            type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir",        type=str, default="./pred_outputs")
@@ -289,7 +345,6 @@ if __name__ == "__main__":
                         help="Guided filter radius in pixels (only if smoothing_mode=guided).")
     parser.add_argument("--guided_eps",     type=float, default=1e-3,
                         help="Guided filter regularization epsilon (only if smoothing_mode=guided).")
-
 
     args = parser.parse_args()
 

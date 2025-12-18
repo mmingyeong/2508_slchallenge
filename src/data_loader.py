@@ -5,10 +5,11 @@ Strong-lensing binary classification loader with independent toggles:
 - apply_padding: center constant-pad 41x41 -> out_size_when_padded (default 64)
 - apply_normalization: background subtraction -> (optional) high-quantile clip -> z-score (or MAD)
 - smoothing: one of {none, gaussian, guided, psf} applied BEFORE normalization and BEFORE padding
-...
-- Smoothing is applied on the original 41x41 grid (not on padded images), BEFORE normalization.
-"""
 
+NOTE:
+- For large-scale inference, this module can consume either directories (glob *.fits)
+  or pre-built manifest list files (one path per line) provided via predict.py.
+"""
 
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
@@ -65,21 +66,58 @@ def make_safe_collate(out_size: int) -> Callable:
     return safe_collate
 
 
-# ---------------- helper: collect files ----------------
-def collect_files(class_paths: Dict[str, str]) -> Tuple[List[str], List[int], List[str]]:
+# ---------------- helper: collect files from dir-or-list ----------------
+def _collect_from_dir(dir_path: Optional[str]) -> List[str]:
+    if not dir_path:
+        return []
+    dpath = Path(dir_path)
+    if not dpath.exists():
+        logger.warning(f"Missing directory: {dpath}")
+        return []
+    # Glob *.fits only (sorted for stability)
+    return sorted(str(p) for p in dpath.glob("*.fits"))
+
+def _collect_from_list(paths: Optional[List[str]]) -> List[str]:
+    # Trust the manifest for performance at extreme scale (avoid per-file stat).
+    if not paths:
+        return []
+    # Optionally, we could deduplicate:
+    # return list(dict.fromkeys(paths))
+    return list(paths)
+
+def collect_files_from_dirs_or_lists(
+    class_dirs: Dict[str, Optional[str]],
+    class_lists: Dict[str, Optional[List[str]]],
+) -> Tuple[List[str], List[int], List[str]]:
+    """
+    Merge all classes, preferring lists if provided; otherwise fall back to directories.
+
+    Returns:
+        files:   absolute/relative file paths
+        labels:  1 for lenses, 0 for nonlenses
+        domains: "slsim" or "hsc"
+    """
     files, labels, domains = [], [], []
-    for key, d in class_paths.items():
-        dpath = Path(d)
-        if not dpath.exists():
-            logger.warning(f"Missing directory: {dpath}")
-            continue
+    keys = ("slsim_lenses", "slsim_nonlenses", "hsc_lenses", "hsc_nonlenses")
+    for key in keys:
+        # choose list first for performance/reproducibility
+        src_list = class_lists.get(key)
+        if src_list:
+            fs = _collect_from_list(src_list)
+            src_desc = f"LIST({len(fs)})"
+        else:
+            fs = _collect_from_dir(class_dirs.get(key))
+            src_desc = f"DIR({class_dirs.get(key)}) -> {len(fs)}"
+
         label = 0 if "nonlenses" in key.lower() else 1
         domain = "slsim" if "slsim" in key.lower() else "hsc"
-        fs = sorted(str(p) for p in dpath.glob("*.fits"))
+
         files.extend(fs)
         labels.extend([label] * len(fs))
         domains.extend([domain] * len(fs))
-        logger.info(f"Collected {len(fs)} from '{key}' ({dpath}), label={label}, domain={domain}")
+
+        logger.info(f"Collected {len(fs)} from '{key}' via {src_desc}, label={label}, domain={domain}")
+
     logger.info(f"TOTAL files collected: {len(files)}")
     return files, labels, domains
 
@@ -121,6 +159,7 @@ def _read_fits_image_41x41(fits_path: str):
                         v = np.asarray(tbl[names[col_idx]][0])
                         data = v.reshape(41, 41)
         else:
+            from astropy.io import fits  # type: ignore
             with fits.open(fits_path, memmap=False) as hdul:
                 data = None
                 # 1) try PRIMARY
@@ -157,7 +196,6 @@ def _read_fits_image_41x41(fits_path: str):
 
 
 # ---------------- smoothing utilities ----------------
-
 def _gaussian_kernel1d(sigma: float, truncate: float = 3.0) -> torch.Tensor:
     """Return 1D Gaussian kernel normalized to sum=1 (dtype=float32)."""
     sigma = float(max(sigma, 1e-6))
@@ -258,7 +296,7 @@ class LensFITSBinaryDataset(Dataset):
             True  -> background subtraction -> (optional) high-quantile clip -> z-score (or MAD)
             False -> raw values (float32), no normalization
         smoothing:
-            Applied AFTER normalization, BEFORE padding.
+            Applied BEFORE normalization and BEFORE padding on 41x41 grid.
             - "none": no smoothing
             - "gaussian": Gaussian blur with gaussian_sigma (pixels)
             - "guided": self-guided filter with guided_radius r and guided_eps
@@ -300,32 +338,24 @@ class LensFITSBinaryDataset(Dataset):
 
     @staticmethod
     def _augment(img: torch.Tensor) -> torch.Tensor:
-        # 1. 기본 대칭 변환 (현재 유지)
+        # 1. rotations/flips
         k = random.randint(0, 3)
         img = torch.rot90(img, k, dims=(-2, -1))
         if random.random() < 0.5: img = torch.flip(img, dims=[-1])
         if random.random() < 0.5: img = torch.flip(img, dims=[-2])
-
-        # 2. 현실적인 노이즈/밝기 변환 추가
+        # 2. mild noise / gamma (optional; keep conservative for eval)
         if random.random() < 0.5:
-            # 가우시안 노이즈 추가 (데이터셋의 통계에 맞게 std 조정 필요)
-            noise = torch.randn_like(img) * 0.01 
+            noise = torch.randn_like(img) * 0.01
             img = img + noise
-
         if random.random() < 0.5:
-            # 밝기 및 대비 조절 (예: 무작위 감마 보정)
             gamma = random.uniform(0.8, 1.2)
-            img = torch.pow(img.clamp(min=1e-6), gamma) # clamp로 0 나누기 방지
-
+            img = torch.pow(img.clamp(min=1e-6), gamma)
         return img
-    
+
     def _normalize(self, img: torch.Tensor) -> torch.Tensor:
         """
         Background subtraction -> optional high-quantile clip -> z-score (or MAD).
-        Operates on 41x41; smoothing (if any) is applied beforehand.
         """
-
-
         x = img.clone()
 
         # (1) Background subtraction: median of lowest 20% pixels
@@ -335,7 +365,7 @@ class LensFITSBinaryDataset(Dataset):
         bkg = torch.median(low) if low.numel() > 0 else torch.median(v)
         x = x - bkg
 
-        # (2) High-tail clipping (and optional low-tail)
+        # (2) High-/Low-tail clipping
         if self.clip_q is not None:
             v = x.flatten()
             hi = torch.quantile(v, self.clip_q)
@@ -360,20 +390,17 @@ class LensFITSBinaryDataset(Dataset):
 
     def _apply_smoothing(self, x: torch.Tensor, domain: str) -> torch.Tensor:
         """
-        Apply smoothing on (41,41) tensor AFTER normalization, BEFORE padding.
+        Apply smoothing on (41,41) tensor BEFORE normalization and BEFORE padding.
         """
         mode = self.smoothing_mode
         if mode == "none":
             return x
-
         if mode == "gaussian":
             return _gaussian_blur_2d(x, self.gaussian_sigma)
-
         if mode == "guided":
             r = max(1, self.guided_radius)
             eps = max(1e-8, self.guided_eps)
             return _guided_filter_self(x, r=r, eps=eps)
-
         if mode == "psf":
             # require target fwhm and per-domain input fwhm
             if self.psf_target_fwhm is None:
@@ -381,15 +408,13 @@ class LensFITSBinaryDataset(Dataset):
             target_sigma = _fwhm_to_sigma(self.psf_target_fwhm)
             current_fwhm = self.psf_input_fwhm_by_domain.get(str(domain).lower(), None)
             if current_fwhm is None:
-                # if missing domain info, skip (no blur) to avoid over-smoothing
+                # if missing domain info, skip to avoid over-smoothing
                 return x
             current_sigma = _fwhm_to_sigma(current_fwhm)
             sigma_k = _psf_sigma_kernel(current_sigma, target_sigma)
             if sigma_k <= 0:
                 return x
             return _gaussian_blur_2d(x, sigma_k)
-
-        # fallback
         return x
 
     def _maybe_pad(self, x: torch.Tensor, bg_value: float = 0.0) -> torch.Tensor:
@@ -414,22 +439,20 @@ class LensFITSBinaryDataset(Dataset):
             if img is None or (not torch.isfinite(img).all()):
                 raise ValueError(f"Skipping corrupted file: {fp}")
 
-            # start from raw float
-            x = img.to(torch.float32)          # (41,41) raw
+            x = img.to(torch.float32)          # raw (41,41)
 
-            # 1) smoothing (BEFORE normalization)
+            # 1) smoothing BEFORE normalization
             x = self._apply_smoothing(x, domain=domain)
 
-            # 2) normalization
+            # 2) normalization (optional)
             if self.apply_normalization:
-                x = self._normalize(x)         # normalize the smoothed image
+                x = self._normalize(x)
 
-
-            # padding (after smoothing)
+            # 3) padding AFTER smoothing/normalization
             x = self._maybe_pad(x)             # (41,41) or (64,64)
             x = x.unsqueeze(0).to(torch.float32)
 
-            # optional augmentation
+            # optional augmentation (train only)
             if self.augment:
                 x = self._augment(x)
 
@@ -441,7 +464,9 @@ class LensFITSBinaryDataset(Dataset):
 
 # ---------------- Public API ----------------
 def get_dataloaders(
-    class_paths: Dict[str, str],
+    *,
+    class_dirs: Dict[str, Optional[str]],
+    class_lists: Dict[str, Optional[List[str]]],
     batch_size: int = 128,
     split: Tuple[float, float, float] = (0.70, 0.15, 0.15),
     seed: int = 42,
@@ -468,12 +493,16 @@ def get_dataloaders(
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     IMPORTANT: For fair evaluation, keep the same toggles for train/val/test.
+    Accepts either directories or manifest lists (lists take precedence for performance).
     """
     assert abs(sum(split) - 1.0) < 1e-6, "split must sum to 1.0"
 
-    files, labels, domains = collect_files(class_paths)
+    files, labels, domains = collect_files_from_dirs_or_lists(class_dirs, class_lists)
 
     idx_all = np.arange(len(files))
+    if len(idx_all) == 0:
+        raise ValueError("No files collected. Check inputs (dirs or lists).")
+
     tr_idx, tmp_idx, y_tr, y_tmp = train_test_split(
         idx_all, labels, test_size=(1.0 - split[0]), random_state=seed, stratify=labels
     )
@@ -506,7 +535,7 @@ def get_dataloaders(
         te_f, te_y, te_d = [te_f[i] for i in keep], [te_y[i] for i in keep], [te_d[i] for i in keep]
         logger.info(f"Test subsampling: kept {k}/{len(te_idx)} ({take_test_fraction*100:.2f}%)")
 
-    # --- build datasets (avoid duplicate 'augment' kw) ---
+    # --- build datasets ---
     ds_args_common = dict(
         apply_padding=apply_padding,
         out_size_when_padded=out_size_when_padded,

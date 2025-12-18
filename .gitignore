@@ -37,7 +37,6 @@ tmp/
 *_pred_*/
 
 # === Final submission or intermediate results ===
-final/
 submission*.csv
 *.hdf5
 *.h5
@@ -51,6 +50,7 @@ datasets/
 *.tar.gz
 *.npy
 *.npz
+*.csv
 
 # === Backup or temporary ===
 *.bak
